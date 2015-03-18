@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"flag"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
@@ -34,18 +33,10 @@ func main() {
 	snapshotPath := flag.String("snapshot", "", "snapshot path")
 	flag.Parse()
 
-	var a *Aggregator
-	if *snapshotPath == "" {
-		a = NewAggregator(*logAddr)
-	} else {
-		snapshotFile, err := os.Open(*snapshotPath)
-		if err == nil {
-			if a, err = LoadAggregator(*logAddr, snapshotFile); err != nil {
-				shutdown.Fatal(err)
-			}
-		} else if os.IsNotExist(err) {
-			a = NewAggregator(*logAddr)
-		} else {
+	a := NewAggregator(*logAddr)
+
+	if *snapshotPath != "" {
+		if err := a.ReplaySnapshot(*snapshotPath); err != nil {
 			shutdown.Fatal(err)
 		}
 	}
@@ -79,35 +70,23 @@ type Aggregator struct {
 	listener   net.Listener
 	producerwg sync.WaitGroup
 
+	msgc chan *rfc5424.Message
+
 	once     sync.Once // protects the following:
 	shutdown chan struct{}
 }
 
 // NewAggregator creates a new unstarted Aggregator that will listen on addr.
 func NewAggregator(addr string) *Aggregator {
-	return &Aggregator{
+	a := &Aggregator{
 		Addr:     addr,
 		buffers:  make(map[string]*ring.Buffer),
 		shutdown: make(chan struct{}),
-	}
-}
-
-func LoadAggregator(addr string, r io.Reader) (*Aggregator, error) {
-	data, err := ioutil.ReadAll(r)
-	if err != nil {
-		return nil, err
+		msgc:     make(chan *rfc5424.Message),
 	}
 
-	buffers, err := snapshot.Load(data)
-	if err != nil {
-		return nil, err
-	}
-
-	return &Aggregator{
-		Addr:     addr,
-		buffers:  buffers,
-		shutdown: make(chan struct{}),
-	}, nil
+	go a.run()
+	return a
 }
 
 // Start starts the Aggregator on Addr.
@@ -134,6 +113,7 @@ func (a *Aggregator) Shutdown() {
 		close(a.shutdown)
 		a.listener.Close()
 		a.producerwg.Wait()
+		close(a.msgc)
 	})
 }
 
@@ -174,19 +154,29 @@ func (a *Aggregator) ReadLastN(
 func (a *Aggregator) TakeSnapshot(w io.Writer) error {
 	// TODO(benburkert): restructure Aggregator & ring.Buffer to avoid nested locks
 	a.bmu.Lock()
-	cbufs := make(map[string]*ring.Buffer, len(a.buffers))
-	for key, buf := range a.buffers {
-		cbufs[key] = buf.Clone()
+	bufs := make([][]*rfc5424.Message, 0, len(a.buffers))
+	for _, buf := range a.buffers {
+		bufs = append(bufs, buf.Clone().ReadAll())
 	}
 	a.bmu.Unlock()
 
-	data, err := snapshot.Take(cbufs)
+	return snapshot.Take(bufs, w)
+}
+
+func (a *Aggregator) ReplaySnapshot(path string) error {
+	f, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
 
-	_, err = w.Write(data)
-	return err
+	s := snapshot.NewScanner(f)
+	for s.Scan() {
+		a.msgc <- s.Message
+	}
+	return s.Err()
 }
 
 // readLastN reads up to N logs from the log buffer with id. If n is less than
@@ -327,16 +317,17 @@ func (a *Aggregator) readLogsFromConn(conn net.Conn) {
 	s := bufio.NewScanner(conn)
 	s.Split(rfc6587.Split)
 	for s.Scan() {
-		msgBytes := s.Bytes()
-		// slice in msgBytes could get modified on next Scan(), need to copy it
-		msgCopy := make([]byte, len(msgBytes))
-		copy(msgCopy, msgBytes)
-
-		msg, err := rfc5424.Parse(msgCopy)
+		msg, err := rfc5424.Parse(s.Bytes())
 		if err != nil {
 			log15.Error("rfc5424 parse error", "err", err)
-			continue
+		} else {
+			a.msgc <- msg
 		}
+	}
+}
+
+func (a *Aggregator) run() {
+	for msg := range a.msgc {
 		a.getOrInitializeBuffer(string(msg.AppName)).Add(msg)
 		if afterMessage != nil {
 			afterMessage()

@@ -1,57 +1,50 @@
 package snapshot
 
-//go:generate protoc --gogo_out=. snapshot.proto
-
 import (
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/gogo/protobuf/proto"
-	"github.com/flynn/flynn/logaggregator/ring"
+	"encoding/gob"
+	"io"
+
 	"github.com/flynn/flynn/pkg/syslog/rfc5424"
 )
 
-func Take(buffers map[string]*ring.Buffer) ([]byte, error) {
-	ss := &Snapshot{
-		Buffers: make([]*SnapshotBuffer, 0, len(buffers)),
-	}
+func Take(buffers [][]*rfc5424.Message, w io.Writer) error {
+	enc := gob.NewEncoder(w)
 
-	for key, buf := range buffers {
-		msgs := buf.ReadAll()
-
-		sbuf := &SnapshotBuffer{
-			Key:      &key,
-			Messages: make([][]byte, len(msgs)),
+	for _, buf := range buffers {
+		for _, msg := range buf {
+			if err := enc.Encode(msg); err != nil {
+				return err
+			}
 		}
-
-		for i, msg := range msgs {
-			sbuf.Messages[i] = msg.Bytes()
-		}
-
-		ss.Buffers = append(ss.Buffers, sbuf)
 	}
-
-	return proto.Marshal(ss)
+	return nil
 }
 
-func Load(data []byte) (map[string]*ring.Buffer, error) {
-	ss := &Snapshot{}
-	if err := proto.Unmarshal(data, ss); err != nil {
-		return nil, err
+type Scanner struct {
+	dec *gob.Decoder
+	err error
+
+	Message *rfc5424.Message
+}
+
+func NewScanner(r io.Reader) *Scanner {
+	return &Scanner{dec: gob.NewDecoder(r)}
+}
+
+func (s *Scanner) Scan() bool {
+	msg := &rfc5424.Message{}
+	err := s.dec.Decode(msg)
+	if err != nil {
+		s.err = err
+		return false
 	}
+	s.Message = msg
+	return true
+}
 
-	buffers := make(map[string]*ring.Buffer, len(ss.Buffers))
-	for _, sbuf := range ss.Buffers {
-		rbuf := ring.NewBuffer()
-
-		for _, msg := range sbuf.Messages {
-			smsg, err := rfc5424.Parse(msg)
-			if err != nil {
-				return nil, err
-			}
-
-			rbuf.Add(smsg)
-		}
-
-		buffers[*sbuf.Key] = rbuf
+func (s *Scanner) Err() error {
+	if s.err != io.EOF {
+		return s.err
 	}
-
-	return buffers, nil
+	return nil
 }
